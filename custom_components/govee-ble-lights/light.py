@@ -1,56 +1,61 @@
 from __future__ import annotations
 
 import array
+import base64
+import json
 import logging
 import re
+from pathlib import Path
 
-from enum import IntEnum
 import bleak_retry_connector
-
 from bleak import BleakClient
 from homeassistant.components import bluetooth
 from homeassistant.components.light import (ATTR_BRIGHTNESS, ATTR_RGB_COLOR, ATTR_EFFECT, ColorMode, LightEntity,
                                             LightEntityFeature, ATTR_COLOR_TEMP_KELVIN)
-
-from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
 from homeassistant.helpers.storage import Store
 import homeassistant.util.color as color_util
 
-from .const import DOMAIN
-from pathlib import Path
-import json
-from .govee_utils import prepareMultiplePacketsData
-import base64
 from . import Hub
-from datetime import timedelta
-
-SCAN_INTERVAL = timedelta(seconds=30)
-
+from .connection import GoveeConnection, GoveeConnectionError
+from .const import DOMAIN
+from .govee_utils import prepareMultiplePacketsData
+from .protocol import (
+    JSONS_DIR,
+    LedCommand,
+    LedMode,
+    build_frame,
+    parse_local_name,
+    resolve_catalog_model,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-UUID_CONTROL_CHARACTERISTIC = '00010203-0405-0607-0809-0a0b0c0d2b11'
-EFFECT_PARSE = re.compile("\[(\d+)/(\d+)/(\d+)/(\d+)]")
+EFFECT_PARSE = re.compile(r"\[(\d+)/(\d+)/(\d+)/(\d+)]")
 SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199']
 
-class LedCommand(IntEnum):
-    """ A control command packet's type. """
-    POWER = 0x01
-    BRIGHTNESS = 0x04
-    COLOR = 0x05
 
+def _load_catalog(catalog_model: str) -> tuple[dict, list[str]]:
+    """Read a scene catalog from disk and flatten it into an effect list.
 
-class LedMode(IntEnum):
+    Runs in the executor: the JSON files are 50-500 KB and this used to be
+    done synchronously inside a property on every access (upstream #86).
     """
-    The mode in which a color change happens in.
-    
-    Currently only manual is supported.
-    """
-    MANUAL = 0x02
-    MICROPHONE = 0x06
-    SCENES = 0x05
-    SEGMENTS = 0x15
+    json_data = json.loads(Path(JSONS_DIR / f"{catalog_model}.json").read_text())
+    effect_list = []
+    for category_idx, category in enumerate(json_data['data']['categories']):
+        for scene_idx, scene in enumerate(category['scenes']):
+            for effect_idx, light_effect in enumerate(scene['lightEffects']):
+                for special_idx, _special_effect in enumerate(light_effect['specialEffect']):
+                    indexes = f"{category_idx}/{scene_idx}/{effect_idx}/{special_idx}"
+                    effect_list.append(
+                        f"{category['categoryName']} - {scene['sceneName']} - "
+                        f"{light_effect['scenceName']} [{indexes}]"
+                    )
+    return json_data, effect_list
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities):
@@ -67,7 +72,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, asyn
                 async_add_entities([GoveeAPILight(hub, device)])
     elif hub.address is not None:
         ble_device = bluetooth.async_ble_device_from_address(hass, hub.address.upper(), False)
-        async_add_entities([GoveeBluetoothLight(hub, ble_device, config_entry)])
+        async_add_entities([GoveeBluetoothLight(hass, hub, ble_device, config_entry)])
 
 
 class GoveeAPILight(LightEntity, dict):
@@ -208,8 +213,9 @@ class GoveeBluetoothLight(LightEntity):
     _attr_supported_features = LightEntityFeature(
         LightEntityFeature.EFFECT | LightEntityFeature.FLASH | LightEntityFeature.TRANSITION)
 
-    def __init__(self, hub: Hub, ble_device, config_entry: ConfigEntry) -> None:
-        """Initialize an bluetooth light."""
+    def __init__(self, hass: HomeAssistant, hub: Hub, ble_device, config_entry: ConfigEntry) -> None:
+        """Initialize a bluetooth light."""
+        self._hass = hass
         self._mac = hub.address
         self._model = config_entry.data["model"]
         self._is_segmented = self._model in SEGMENTED_MODELS
@@ -217,28 +223,55 @@ class GoveeBluetoothLight(LightEntity):
         self._state = None
         self._brightness = None
 
+        parsed = parse_local_name(getattr(ble_device, "name", "") or "")
+        suffix = parsed[1] if parsed and parsed[1] else self._mac.replace(":", "")[-4:].upper()
+        self._attr_name = f"Govee {self._model} {suffix}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, self._mac)},
+            connections={(CONNECTION_BLUETOOTH, self._mac)},
+            manufacturer="Govee",
+            model=self._model,
+            name=self._attr_name,
+        )
+
+        self._catalog_model = resolve_catalog_model(self._model)
+        self._scene_json: dict | None = None
+        self._attr_effect_list: list[str] | None = None
+
+        self._connection = GoveeConnection(
+            get_ble_device=self._current_ble_device,
+            name=self._attr_name,
+            connector=self._connect_client,
+        )
+
+    async def async_added_to_hass(self) -> None:
+        if self._catalog_model is not None:
+            self._scene_json, self._attr_effect_list = await self._hass.async_add_executor_job(
+                _load_catalog, self._catalog_model
+            )
+
+    async def async_will_remove_from_hass(self) -> None:
+        await self._connection.disconnect()
+
+    def _current_ble_device(self):
+        fresh = bluetooth.async_ble_device_from_address(self._hass, self._mac.upper(), True)
+        if fresh is not None:
+            self._ble_device = fresh
+        return self._ble_device
+
+    async def _connect_client(self, ble_device, disconnected_callback):
+        return await bleak_retry_connector.establish_connection(
+            BleakClient, ble_device, self.unique_id,
+            disconnected_callback=disconnected_callback,
+        )
+
     @property
     def effect_list(self) -> list[str] | None:
-        effect_list = []
-        json_data = json.loads(Path(Path(__file__).parent / "jsons" / (self._model + ".json")).read_text())
-        for categoryIdx, category in enumerate(json_data['data']['categories']):
-            for sceneIdx, scene in enumerate(category['scenes']):
-                for leffectIdx, lightEffect in enumerate(scene['lightEffects']):
-                    for seffectIxd, specialEffect in enumerate(lightEffect['specialEffect']):
-                        # if 'supportSku' not in specialEffect or self._model in specialEffect['supportSku']:
-                        # Workaround cause we need to store some metadata in effect (effect names not unique)
-                        indexes = str(categoryIdx) + "/" + str(sceneIdx) + "/" + str(leffectIdx) + "/" + str(
-                            seffectIxd)
-                        effect_list.append(
-                            category['categoryName'] + " - " + scene['sceneName'] + ' - ' + lightEffect[
-                                'scenceName'] + " [" + indexes + "]")
-
-        return effect_list
+        return self._attr_effect_list
 
     @property
     def name(self) -> str:
-        """Return the name of the switch."""
-        return "GOVEE Light"
+        return self._attr_name
 
     @property
     def unique_id(self) -> str:
@@ -255,87 +288,50 @@ class GoveeBluetoothLight(LightEntity):
         return self._state
 
     async def async_turn_on(self, **kwargs) -> None:
-        commands = [self._prepareSinglePacketData(LedCommand.POWER, [0x1])]
-
-        self._state = True
+        commands = [build_frame(LedCommand.POWER, [0x1])]
 
         if ATTR_BRIGHTNESS in kwargs:
             brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
-            commands.append(self._prepareSinglePacketData(LedCommand.BRIGHTNESS, [brightness]))
-            self._brightness = brightness
+            commands.append(build_frame(LedCommand.BRIGHTNESS, [brightness]))
 
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
 
             if self._is_segmented:
-                commands.append(self._prepareSinglePacketData(LedCommand.COLOR,
-                                                              [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
-                                                               0x00, 0x00, 0xFF, 0x7F]))
+                commands.append(build_frame(LedCommand.COLOR,
+                                            [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
+                                             0x00, 0x00, 0xFF, 0x7F]))
             else:
-                commands.append(self._prepareSinglePacketData(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
-        if ATTR_EFFECT in kwargs:
+                commands.append(build_frame(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
+
+        if ATTR_EFFECT in kwargs and self._scene_json is not None:
             effect = kwargs.get(ATTR_EFFECT)
             if len(effect) > 0:
                 search = EFFECT_PARSE.search(effect)
+                if search is not None:
+                    category = self._scene_json['data']['categories'][int(search.group(1))]
+                    scene = category['scenes'][int(search.group(2))]
+                    light_effect = scene['lightEffects'][int(search.group(3))]
+                    special_effect = light_effect['specialEffect'][int(search.group(4))]
 
-                # Parse effect indexes
-                categoryIndex = int(search.group(1))
-                sceneIndex = int(search.group(2))
-                lightEffectIndex = int(search.group(3))
-                specialEffectIndex = int(search.group(4))
+                    # The scene payload exceeds one frame; send as chunked 0xa3 packets
+                    commands.extend(prepareMultiplePacketsData(
+                        0xa3,
+                        array.array('B', [0x02]),
+                        array.array('B', base64.b64decode(special_effect['scenceParam'])),
+                    ))
 
-                json_data = json.loads(Path(Path(__file__).parent / "jsons" / (self._model + ".json")).read_text())
-                category = json_data['data']['categories'][categoryIndex]
-                scene = category['scenes'][sceneIndex]
-                lightEffect = scene['lightEffects'][lightEffectIndex]
-                specialEffect = lightEffect['specialEffect'][specialEffectIndex]
-
-                # Prepare packets to send big payload in separated chunks
-                for command in prepareMultiplePacketsData(0xa3,
-                                                          array.array('B', [0x02]),
-                                                          array.array('B',
-                                                                      base64.b64decode(specialEffect['scenceParam'])
-                                                                      )):
-                    commands.append(command)
-
-        for command in commands:
-            client = await self._connectBluetooth()
-            await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC, command, False)
+        await self._send(commands)
+        self._state = True
+        if ATTR_BRIGHTNESS in kwargs:
+            self._brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
 
     async def async_turn_off(self, **kwargs) -> None:
-        client = await self._connectBluetooth()
-        await client.write_gatt_char(UUID_CONTROL_CHARACTERISTIC,
-                                     self._prepareSinglePacketData(LedCommand.POWER, [0x0]), False)
+        await self._send([build_frame(LedCommand.POWER, [0x0])])
         self._state = False
 
-    async def _connectBluetooth(self) -> BleakClient:
-        for i in range(3):
-            try:
-                client = await bleak_retry_connector.establish_connection(BleakClient, self._ble_device, self.unique_id)
-                return client
-            except:
-                continue
-
-    def _prepareSinglePacketData(self, cmd, payload):
-        if not isinstance(cmd, int):
-            raise ValueError('Invalid command')
-        if not isinstance(payload, bytes) and not (
-                isinstance(payload, list) and all(isinstance(x, int) for x in payload)):
-            raise ValueError('Invalid payload')
-        if len(payload) > 17:
-            raise ValueError('Payload too long')
-
-        cmd = cmd & 0xFF
-        payload = bytes(payload)
-
-        frame = bytes([0x33, cmd]) + bytes(payload)
-        # pad frame data to 19 bytes (plus checksum)
-        frame += bytes([0] * (19 - len(frame)))
-
-        # The checksum is calculated by XORing all data bytes
-        checksum = 0
-        for b in frame:
-            checksum ^= b
-
-        frame += bytes([checksum & 0xFF])
-        return frame
+    async def _send(self, commands: list[bytes]) -> None:
+        try:
+            await self._connection.send(commands)
+        except GoveeConnectionError as err:
+            raise HomeAssistantError(f"{self._attr_name}: {err}") from err

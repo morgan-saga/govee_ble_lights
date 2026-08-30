@@ -14,7 +14,7 @@ from homeassistant.const import (CONF_ADDRESS, CONF_MODEL, CONF_API_KEY, CONF_TY
 from homeassistant.data_entry_flow import FlowResult
 
 from .const import DOMAIN, CONF_TYPE_API, CONF_TYPE_BLE
-from pathlib import Path
+from .protocol import available_models, parse_local_name
 
 class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
@@ -33,11 +33,7 @@ class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
             CONF_TYPE_BLE: 'BLE',
         }
 
-        jsons_path = Path(Path(__file__).parent / "jsons")
-        for file in jsons_path.iterdir():
-            self._available_models.append(file.name.replace(".json", ""))
-
-        self._available_models.sort()
+        self._available_models = available_models()
 
     async def async_step_bluetooth(
             self, discovery_info: BluetoothServiceInfoBleak
@@ -67,11 +63,19 @@ class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
             "model": "Device model"
         }
         self.context["title_placeholders"] = placeholders
+
+        # Pre-select the model when the advertisement name carries it
+        # (e.g. ihoment_H601C_60DD -> H601C).
+        parsed = parse_local_name(title or "")
+        model_key = vol.Required(CONF_MODEL)
+        if parsed is not None and parsed[0] in self._available_models:
+            model_key = vol.Required(CONF_MODEL, default=parsed[0])
+
         return self.async_show_form(
             step_id="bluetooth_confirm",
             description_placeholders=placeholders,
             data_schema=vol.Schema({
-                vol.Required(CONF_MODEL): vol.In(self._available_models)
+                model_key: vol.In(self._available_models)
             }),
         )
 
