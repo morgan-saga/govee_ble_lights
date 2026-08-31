@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import array
 import base64
-import json
 import logging
 import re
-from pathlib import Path
-
 import bleak_retry_connector
 from bleak import BleakClient
 from homeassistant.components import bluetooth
@@ -25,6 +22,7 @@ from .const import DOMAIN
 from .govee_utils import prepareMultiplePacketsData
 from .protocol import (
     JSONS_DIR,
+    load_catalog,
     LedCommand,
     LedMode,
     build_frame,
@@ -35,28 +33,8 @@ from .protocol import (
 
 _LOGGER = logging.getLogger(__name__)
 
-EFFECT_PARSE = re.compile(r"\[(\d+)/(\d+)/(\d+)/(\d+)]")
+EFFECT_PARSE = re.compile(r"\[(\d+)/(\d+)/(\d+)/(-?\d+)]")
 SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199']
-
-
-def _load_catalog(catalog_model: str) -> tuple[dict, list[str]]:
-    """Read a scene catalog from disk and flatten it into an effect list.
-
-    Runs in the executor: the JSON files are 50-500 KB and this used to be
-    done synchronously inside a property on every access (upstream #86).
-    """
-    json_data = json.loads(Path(JSONS_DIR / f"{catalog_model}.json").read_text())
-    effect_list = []
-    for category_idx, category in enumerate(json_data['data']['categories']):
-        for scene_idx, scene in enumerate(category['scenes']):
-            for effect_idx, light_effect in enumerate(scene['lightEffects']):
-                for special_idx, _special_effect in enumerate(light_effect['specialEffect']):
-                    indexes = f"{category_idx}/{scene_idx}/{effect_idx}/{special_idx}"
-                    effect_list.append(
-                        f"{category['categoryName']} - {scene['sceneName']} - "
-                        f"{light_effect['scenceName']} [{indexes}]"
-                    )
-    return json_data, effect_list
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities):
@@ -247,9 +225,15 @@ class GoveeBluetoothLight(LightEntity):
 
     async def async_added_to_hass(self) -> None:
         if self._catalog_model is not None:
-            self._scene_json, self._attr_effect_list = await self._hass.async_add_executor_job(
-                _load_catalog, self._catalog_model
-            )
+            try:
+                self._scene_json, self._attr_effect_list = await self._hass.async_add_executor_job(
+                    load_catalog, self._catalog_model
+                )
+            except Exception as err:  # noqa: BLE001 - a bad catalog must not kill the entity
+                _LOGGER.warning(
+                    "%s: scene catalog %s failed to load (%s); effects disabled",
+                    self._attr_name, self._catalog_model, err,
+                )
 
     async def async_will_remove_from_hass(self) -> None:
         await self._connection.disconnect()
@@ -307,22 +291,36 @@ class GoveeBluetoothLight(LightEntity):
             else:
                 commands.append(build_frame(LedCommand.COLOR, [LedMode.MANUAL, red, green, blue]))
 
-        if ATTR_EFFECT in kwargs and self._scene_json is not None:
-            effect = kwargs.get(ATTR_EFFECT)
-            if len(effect) > 0:
+        if ATTR_EFFECT in kwargs:
+            effect = kwargs.get(ATTR_EFFECT) or ""
+            if effect and self._scene_json is None:
+                _LOGGER.warning("%s: effect '%s' requested but no scene catalog is loaded",
+                                self._attr_name, effect)
+            elif effect:
                 search = EFFECT_PARSE.search(effect)
-                if search is not None:
-                    category = self._scene_json['data']['categories'][int(search.group(1))]
-                    scene = category['scenes'][int(search.group(2))]
-                    light_effect = scene['lightEffects'][int(search.group(3))]
-                    special_effect = light_effect['specialEffect'][int(search.group(4))]
-
-                    # The scene payload exceeds one frame; send as chunked 0xa3 packets
-                    commands.extend(prepareMultiplePacketsData(
-                        0xa3,
-                        array.array('B', [0x02]),
-                        array.array('B', base64.b64decode(special_effect['scenceParam'])),
-                    ))
+                if search is None:
+                    _LOGGER.warning("%s: effect '%s' not recognized (missing [c/s/l/e] index)",
+                                    self._attr_name, effect)
+                else:
+                    try:
+                        category = self._scene_json['data']['categories'][int(search.group(1))]
+                        scene = category['scenes'][int(search.group(2))]
+                        light_effect = scene['lightEffects'][int(search.group(3))]
+                        special_idx = int(search.group(4))
+                        if special_idx >= 0:
+                            param = light_effect['specialEffect'][special_idx]['scenceParam']
+                        else:
+                            param = light_effect['scenceParam']
+                    except (IndexError, KeyError) as err:
+                        _LOGGER.warning("%s: effect '%s' no longer matches the catalog (%s)",
+                                        self._attr_name, effect, err)
+                    else:
+                        # The scene payload exceeds one frame; send as chunked 0xa3 packets
+                        commands.extend(prepareMultiplePacketsData(
+                            0xa3,
+                            array.array('B', [0x02]),
+                            array.array('B', base64.b64decode(param)),
+                        ))
 
         await self._send(commands)
         self._state = True

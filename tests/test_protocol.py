@@ -33,3 +33,8 @@ def test_keepalive_frame_matches_live_accepted_bytes():
 def test_payload_longer_than_17_bytes_rejected():
     with pytest.raises(ValueError):
         build_frame(LedCommand.COLOR, [0x00] * 18)
+
+
+def test_bare_int_payload_rejected():
+    with pytest.raises(ValueError):
+        build_frame(LedCommand.POWER, 1)

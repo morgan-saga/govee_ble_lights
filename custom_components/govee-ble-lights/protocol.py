@@ -4,6 +4,7 @@ Verified live against an H601C Glide downlight (2026-08-30): frames are
 written to GATT characteristic 2b11; the device drops idle connections after
 ~10 s, which the keep-alive frame prevents.
 """
+import json
 import re
 from enum import IntEnum
 from pathlib import Path
@@ -42,6 +43,9 @@ def _checksummed(head: int, body: bytes) -> bytes:
 
 def build_frame(cmd: int, payload: bytes | list[int]) -> bytes:
     """Build a 0x33 command frame: cmd byte, payload, zero-pad, XOR checksum."""
+    if not isinstance(payload, (bytes, bytearray, list)):
+        # bytes(int) would silently yield zero-bytes (POWER, 1 == POWER OFF)
+        raise ValueError(f"invalid payload type: {type(payload).__name__}")
     payload = bytes(payload)
     if len(payload) > FRAME_LEN - 3:
         raise ValueError(f"payload too long: {len(payload)} > {FRAME_LEN - 3}")
@@ -83,13 +87,15 @@ def resolve_catalog_model(model: str) -> str | None:
 
 
 # Models whose BLE brightness command takes 0-100 (values above clamp to 100).
-# Measured live on H601C 2026-08-30; H605C verified to take raw 0-255.
-PERCENT_BRIGHTNESS_PREFIXES = ("H601",)
+# Measured live on H601C 2026-08-30; H601B/D are the same Glide family and
+# H601A its 6" sibling. Explicit set: a "H601" prefix would also sweep in
+# H6010, an unrelated BR30 bulb with an unverified scale.
+PERCENT_BRIGHTNESS_MODELS = {"H601A", "H601B", "H601C", "H601D"}
 
 
 def scale_brightness(model: str, ha_brightness: int) -> int:
     """Convert HA's 0-255 brightness to the device's BLE scale."""
-    if model.startswith(PERCENT_BRIGHTNESS_PREFIXES):
+    if model in PERCENT_BRIGHTNESS_MODELS:
         if ha_brightness <= 0:
             return 0
         return max(1, round(ha_brightness * 100 / 254))
@@ -101,3 +107,28 @@ def available_models() -> list[str]:
     models = {p.stem for p in JSONS_DIR.glob("*.json")}
     models.update(m for m in CATALOG_FALLBACK if resolve_catalog_model(m))
     return sorted(models)
+
+
+def load_catalog(catalog_model: str) -> tuple[dict, list[str]]:
+    """Read a scene catalog and flatten it into (json_data, effect_list).
+
+    Handles both payload shapes: scenes whose lightEffects carry
+    specialEffect entries, and (the H601 Glide family, 61 of 65 scenes)
+    lightEffects that hold the scenceParam directly with specialEffect=[]
+    — the latter are indexed with a -1 sentinel for the specialEffect slot.
+    """
+    json_data = json.loads((JSONS_DIR / f"{catalog_model}.json").read_text(encoding="utf-8"))
+    effect_list: list[str] = []
+    for ci, category in enumerate(json_data["data"]["categories"]):
+        for si, scene in enumerate(category["scenes"]):
+            for li, light_effect in enumerate(scene["lightEffects"]):
+                label = " - ".join(
+                    part for part in (category.get("categoryName"), scene.get("sceneName"),
+                                       light_effect.get("scenceName")) if part)
+                specials = light_effect.get("specialEffect") or []
+                if specials:
+                    for ei in range(len(specials)):
+                        effect_list.append(f"{label} [{ci}/{si}/{li}/{ei}]")
+                elif light_effect.get("scenceParam"):
+                    effect_list.append(f"{label} [{ci}/{si}/{li}/-1]")
+    return json_data, effect_list

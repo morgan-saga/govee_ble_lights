@@ -3,7 +3,8 @@
 Real advertisement names captured in the 2026-08-30 scan:
 ihoment_H601C_60DD, ihoment_H601D_8D5B, Govee_H605C_4645, GBK_H61A0_C927.
 """
-from gbl.protocol import available_models, parse_local_name, resolve_catalog_model
+from gbl.protocol import (available_models, load_catalog, parse_local_name,
+                          resolve_catalog_model)
 
 
 def test_parses_ihoment_prefix():
@@ -48,3 +49,16 @@ def test_available_models_includes_fallback_models():
     assert "H601C" in models
     assert "H601D" in models
     assert models == sorted(models)
+
+
+def test_h601b_catalog_flattens_lighteffect_level_scenes():
+    _, effects = load_catalog("H601B")
+    assert len(effects) >= 60, f"only {len(effects)} effects flattened"
+    assert any("/-1]" in e for e in effects)
+
+
+def test_h601b_effect_labels_are_not_blank():
+    _, effects = load_catalog("H601B")
+    for e in effects:
+        label = e.rsplit(" [", 1)[0]
+        assert label.strip(" -"), f"blank label in {e!r}"

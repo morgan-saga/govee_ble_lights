@@ -124,7 +124,7 @@ async def test_keepalives_flow_while_connection_held():
     conn = make_connection(connector, keepalive_interval=0.05, hold_seconds=60.0)
 
     await conn.send([POWER_ON])
-    await asyncio.sleep(0.17)
+    await asyncio.sleep(0.24)
 
     assert len(client.keepalive_writes()) >= 2
     await conn.disconnect()
@@ -156,4 +156,26 @@ async def test_remote_disconnect_then_next_send_reconnects():
 
     assert connector.calls == 2
     assert second.control_writes() == [POWER_OFF]
+    await conn.disconnect()
+
+
+async def test_send_after_disconnect_raises_closed():
+    client = FakeClient()
+    connector = make_connector([client, FakeClient()])
+    conn = make_connection(connector)
+    await conn.send([POWER_ON])
+    await conn.disconnect()
+    with pytest.raises(GoveeConnectionError):
+        await conn.send([POWER_OFF])
+    assert connector.calls == 1
+
+
+async def test_stale_disconnect_callback_does_not_clobber_new_client():
+    first = FakeClient(fail_writes=1)
+    second = FakeClient()
+    connector = make_connector([first, second])
+    conn = make_connection(connector)
+    await conn.send([POWER_ON])          # first write fails -> reconnect to second
+    first.drop_from_remote()             # late callback from superseded client
+    assert conn.connected is True
     await conn.disconnect()
