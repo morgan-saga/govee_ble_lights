@@ -82,6 +82,20 @@ def resolve_catalog_model(model: str) -> str | None:
     return None
 
 
+# Models whose BLE brightness command takes 0-100 (values above clamp to 100).
+# Measured live on H601C 2026-08-30; H605C verified to take raw 0-255.
+PERCENT_BRIGHTNESS_PREFIXES = ("H601",)
+
+
+def scale_brightness(model: str, ha_brightness: int) -> int:
+    """Convert HA's 0-255 brightness to the device's BLE scale."""
+    if model.startswith(PERCENT_BRIGHTNESS_PREFIXES):
+        if ha_brightness <= 0:
+            return 0
+        return max(1, round(ha_brightness * 100 / 254))
+    return ha_brightness
+
+
 def available_models() -> list[str]:
     """All models offerable in the config flow (own catalog or fallback)."""
     models = {p.stem for p in JSONS_DIR.glob("*.json")}

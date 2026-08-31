@@ -30,6 +30,7 @@ from .protocol import (
     build_frame,
     parse_local_name,
     resolve_catalog_model,
+    scale_brightness,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -292,7 +293,9 @@ class GoveeBluetoothLight(LightEntity):
 
         if ATTR_BRIGHTNESS in kwargs:
             brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
-            commands.append(build_frame(LedCommand.BRIGHTNESS, [brightness]))
+            commands.append(build_frame(
+                LedCommand.BRIGHTNESS, [scale_brightness(self._model, brightness)]
+            ))
 
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
