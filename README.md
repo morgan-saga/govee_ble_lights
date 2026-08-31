@@ -1,93 +1,76 @@
-# Govee BLE Lighting Integration for HomeAssistant
+# govee_ble_lights
 
-![Govee Logo](assets/govee-logo.png)
+Home Assistant custom integration for Govee lights over Bluetooth LE.
 
-A powerful and seamless integration to control your Govee lighting devices via Govee API or BLE directly from HomeAssistant with full features support.
+Fork of [Beshelmek/govee_ble_lights](https://github.com/Beshelmek/govee_ble_lights)
+with the BLE path rewritten around held connections. Upstream has been inactive
+since mid-2025; this fork is maintained for the hardware listed below.
 
----
+## What differs from upstream
 
-## Table of Contents
+**Held connections with keep-alive.** Govee firmware drops idle BLE clients
+after ~10 s and a connect costs 0.6–4 s, so connect-per-command gives
+multi-second latency. This fork holds the link for 600 s after the last
+command, sends a keep-alive frame every 4 s, and reconnects once on send
+failure. Measured command latency: ~0.6 s cold, **17–23 ms warm**
+(H605C at −50 RSSI direct; H601C via an ESPHome-API Bluetooth proxy).
 
-- [Features](#features)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Usage](#usage)
-- [Support & Contribution](#support--contribution)
-- [License](#license)
+Other changes:
 
----
+- Per-model brightness scaling: H601x takes 0–100 (clamped), others raw 0–255.
+- H601C/H601D support: catalog fallback to H601B, two-level scene catalog
+  flattening — H601D exposes its 61 named scenes (upstream showed one blank entry).
+- Failed sends raise `HomeAssistantError` instead of silently returning `None`.
+- Connect attempts capped at 1 — `bleak-retry-connector` already retries
+  internally; the previous 3× wrapper hung for minutes on unreachable devices.
+- Config flow pre-selects the model from the advertised name (`ihoment_H601C_xxxx`).
+- Catalog load failure degrades the entity instead of killing it.
+- 35 unit tests, runnable without a Home Assistant install (`pytest`).
 
-## Features
+## Verified hardware
 
-- 🚀 **Direct BLE Control**: No need for middlewares or bridges. Connect and control your Govee devices directly through Bluetooth Low Energy.
+| Model | Status |
+|---|---|
+| H601C / H601D (Glide downlights) | brightness 0–100, scenes, no status readback |
+| H605C | brightness raw 0–255 |
 
-- ☁️ **API Control**: Supported all light devices with full features support including scenes!
+Basic control (power/brightness/color) uses the generic `0x33` frame protocol
+and should work on most BLE-capable Govee lights; scene support depends on the
+model catalog. Other models are untested. Issues are welcome with the model
+number and a debug log, but this repository is maintained as-is for the
+hardware above.
 
-- 🌈 **Scene Selection**: Leverage the full potential of your Govee lights by choosing from all available scenes, transforming the ambiance of your room instantly.
-  
-- 💡 **Comprehensive Lighting Control**: Adjust brightness, change colors, or switch on/off with ease.
+## Requirements
 
----
+- A working Home Assistant Bluetooth stack: local adapter or an ESPHome
+  Bluetooth proxy in range of the fixtures.
+- Addressing note: on `60:74:F4`-prefixed devices the BLE MAC is the
+  WiFi MAC + 1. The device must be powered (wall switches off = BLE dead).
 
-## Configuration
+## Installation
 
-### What is needed
+### HACS (custom repository)
 
-For Direct BLE Control:
-- Before you begin, make certain HomeAssistant can access BLE on your platform. Ensure your HomeAssistant instance is granted permissions to utilize the Bluetooth Low Energy of your host machine.
+1. HACS → ⋮ → *Custom repositories*
+2. Add `https://github.com/morgan-saga/govee_ble_lights`, category *Integration*
+3. Install, restart Home Assistant
+4. Settings → Devices & services → Add integration → Govee BLE lights
 
-For Govee API Control:
-- Retrieve Govee-API-Key as described [here](https://developer.govee.com/reference/apply-you-govee-api-key), setup integration with API type ad fill your API key.
+### Manual
 
-## Usage
+Copy `custom_components/govee-ble-lights` into `/config/custom_components`
+and restart Home Assistant.
 
-With the integration setup, your Govee devices will appear as entities within HomeAssistant. All you need to do is select your device model when adding it.
+## Behavior notes
 
----
-
-## Troubleshooting for BLE
-
-If you're facing issues with the integration, consider the following steps:
-
-1. **Check BLE Connection**: 
-   
-   Ensure that the Govee device is within the Bluetooth range of your HomeAssistant host machine.
-
-2. **Model Check**:
-
-   Check that you selected correct device model.
-
-3. **Logs**:
-
-   HomeAssistant logs can provide insights into any issues. Navigate to `Configuration > Logs` to review any error messages related to the Govee integration.
-
----
-
-## Support & Contribution
-
-- **Found an Issue?** 
-   
-   Raise it in the [Issues section](https://github.com/Beshelmek/govee_ble_lights/issues) of this repository.
-
-- **Device support**:
-
-   Almost every Govee device has its own BLE message protocol. If you have an Android smartphone and your device is not supported, please contact me on [Telegram](https://t.me/Beshelmek).
-
-- **Contributions**:
-
-   We welcome community contributions! If you'd like to improve the integration or add new features, please fork the repository and submit a pull request.
-
----
-
-## Future Plans
-
-We aim to continuously improve this integration by:
-
-- Supporting more Govee device models for BLE
-- Enhancing the overall user experience and stability
-
----
+- BLE entities are optimistic: H601x firmware has no known status readback,
+  so entity state reflects the last command sent, not the device.
+- A held connection occupies an adapter/proxy slot for up to 600 s after the
+  last command. Size your proxy's max-connections to the number of fixtures
+  you control concurrently.
+- The Govee cloud/API path from upstream is unchanged.
 
 ## License
 
-This project is under the MIT License. For full license details, please refer to the [LICENSE file](https://github.com/Beshelmek/govee_ble_lights/blob/main/LICENSE) in this repository.
+MIT, retained from upstream. Protocol groundwork by the original project and
+community reverse engineering.
