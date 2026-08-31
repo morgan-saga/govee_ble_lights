@@ -38,7 +38,7 @@ class GoveeConnection:
         name: str,
         connector: Connector,
         keepalive_interval: float = 4.0,
-        hold_seconds: float = 120.0,
+        hold_seconds: float = 600.0,
     ) -> None:
         self._get_ble_device = get_ble_device
         self._name = name
