@@ -35,6 +35,9 @@ _LOGGER = logging.getLogger(__name__)
 
 EFFECT_PARSE = re.compile(r"\[(\d+)/(\d+)/(\d+)/(-?\d+)]")
 SEGMENTED_MODELS = ['H6053', 'H6072', 'H6102', 'H6199']
+# H601 Glide downlights ignore MANUAL (0x02) and segment (0x15) color frames;
+# they speak the alternate RGB dialect 0x0D (verified on-device 2026-09-01).
+ALT_RGB_MODELS = ['H601B', 'H601C', 'H601D']
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities):
@@ -198,6 +201,7 @@ class GoveeBluetoothLight(LightEntity):
         self._mac = hub.address
         self._model = config_entry.data["model"]
         self._is_segmented = self._model in SEGMENTED_MODELS
+        self._uses_alt_rgb = self._model in ALT_RGB_MODELS
         self._ble_device = ble_device
         self._state = None
         self._brightness = None
@@ -284,7 +288,9 @@ class GoveeBluetoothLight(LightEntity):
         if ATTR_RGB_COLOR in kwargs:
             red, green, blue = kwargs.get(ATTR_RGB_COLOR)
 
-            if self._is_segmented:
+            if self._uses_alt_rgb:
+                commands.append(build_frame(LedCommand.COLOR, [0x0D, red, green, blue]))
+            elif self._is_segmented:
                 commands.append(build_frame(LedCommand.COLOR,
                                             [LedMode.SEGMENTS, 0x01, red, green, blue, 0x00, 0x00, 0x00,
                                              0x00, 0x00, 0xFF, 0x7F]))
