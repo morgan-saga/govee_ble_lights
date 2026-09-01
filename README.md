@@ -9,20 +9,22 @@ since mid-2025; this fork is maintained for the hardware listed below.
 ## What differs from upstream
 
 **Held connections with keep-alive.** Govee firmware drops idle BLE clients
-after ~10 s and a connect costs 0.6–4 s, so connect-per-command gives
+after ~10 s and a connect costs 0.6-4 s, so connect-per-command gives
 multi-second latency. This fork holds the link for 600 s after the last
 command, sends a keep-alive frame every 4 s, and reconnects once on send
-failure. Measured command latency: ~0.6 s cold, **17–23 ms warm**
-(H605C at −50 RSSI direct; H601C via an ESPHome-API Bluetooth proxy).
+failure. Measured command latency: ~0.6 s cold, **17-23 ms warm**
+(H605C at -50 RSSI direct; H601C via an ESPHome-API Bluetooth proxy).
 
 Other changes:
 
-- Per-model brightness scaling: H601x takes 0–100 (clamped), others raw 0–255.
-- H601C/H601D support: catalog fallback to H601B, two-level scene catalog
-  flattening — H601D exposes its 61 named scenes (upstream showed one blank entry).
+- Per-model brightness scaling: H601x takes 0-100 (clamped), others raw 0-255.
+- H601C/H601D support: catalog fallback to H601B, plus two-level scene catalog
+  flattening so the H601D exposes its 61 named scenes (upstream showed one
+  blank entry).
 - Failed sends raise `HomeAssistantError` instead of silently returning `None`.
-- Connect attempts capped at 1 — `bleak-retry-connector` already retries
-  internally; the previous 3× wrapper hung for minutes on unreachable devices.
+- Connect attempts capped at 1; `bleak-retry-connector` already retries
+  internally, and the previous 3x wrapper hung for minutes on unreachable
+  devices.
 - Config flow pre-selects the model from the advertised name (`ihoment_H601C_xxxx`).
 - Catalog load failure degrades the entity instead of killing it.
 - 35 unit tests, runnable without a Home Assistant install (`pytest`).
@@ -31,8 +33,8 @@ Other changes:
 
 | Model | Status |
 |---|---|
-| H601C / H601D (Glide downlights) | brightness 0–100, scenes, no status readback |
-| H605C | brightness raw 0–255 |
+| H601C / H601D (Glide downlights) | brightness 0-100, scenes, no status readback |
+| H605C | brightness raw 0-255 |
 
 Basic control (power/brightness/color) uses the generic `0x33` frame protocol
 and should work on most BLE-capable Govee lights; scene support depends on the
